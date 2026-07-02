@@ -1,0 +1,78 @@
+name: Build Windows (test)
+
+# Produces an UNSIGNED Windows installer for manual testing — no official
+# release, no publishing to the public repo, no secrets. The .exe is attached
+# to a "Windows test build" release on this fork so it has a clean, direct
+# download link you can open on a Windows machine.
+#
+# Triggers on pushes to the fix branch, plus a manual "Run workflow" button.
+on:
+  push:
+    branches: [fix/windows-project-delete-locked-files]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Force LF line endings
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Use bash for package scripts
+        run: npm config set script-shell "C:\Program Files\Git\bin\bash.exe"
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      # Build only the NSIS installer and disable updater artifacts so the
+      # build doesn't require TAURI_SIGNING_PRIVATE_KEY (createUpdaterArtifacts
+      # is true in tauri.conf.json, which would otherwise fail without the key).
+      - name: Build unsigned Windows installer
+        shell: bash
+        run: pnpm tauri build --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Publish installer to a test-build release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: win-test-delete-fix
+          name: 'Windows test build — project delete (os error 32 / 5) fix'
+          body: |
+            Unsigned Windows installer for testing the project-delete fix
+            (kills the project's processes and clears read-only files before
+            deleting, so os error 32 and os error 5 no longer block deletion).
+
+            To test: open a project, try deleting one that previously failed
+            (ideally one with a dev server or terminal running), and confirm it
+            deletes without "being used by another process" or "Access is
+            denied".
+
+            Windows SmartScreen will warn because it is unsigned — click
+            **More info → Run anyway** to install. The in-app auto-updater is
+            disabled in this build; if prompted to update, choose Later so it
+            doesn't replace the test build.
+          prerelease: true
+          files: src-tauri/target/release/bundle/nsis/*-setup.exe
