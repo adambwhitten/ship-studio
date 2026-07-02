@@ -814,27 +814,34 @@ pub async fn delete_project(path: String) -> Result<(), CommandError> {
         return Err(("Can only delete projects from the projects directory".to_string()).into());
     }
 
-    // Release any handles Ship Studio holds on the project before deleting it.
-    // On Windows a file open by a running dev server or agent terminal makes
-    // `remove_dir_all` fail with "being used by another process" (os error 32);
-    // killing the project's PTYs frees those handles. Harmless on other
-    // platforms, and it avoids orphaning a dev server after the folder is gone.
-    // Match on both the path the caller passed and its canonical form, since the
-    // PTY registry is keyed by whatever path the project was opened with.
+    // Release the handles Ship Studio itself holds on the project before
+    // deleting it, or Windows refuses the delete:
+    //
+    // 1. The snapshots feature runs a recursive `notify` watcher on the project
+    //    directory. On Windows that keeps an open directory handle
+    //    (ReadDirectoryChangesW) which makes `remove_dir_all` fail with "Access
+    //    is denied" (os error 5). Stopping the watcher drops that handle. This
+    //    is not tied to any process, so killing PTYs alone does not fix it.
+    let _ = crate::commands::snapshots::snapshot_stop_watching(path.clone()).await;
+
+    // 2. A running dev server or agent terminal keeps files open, which fails
+    //    with "being used by another process" (os error 32). Killing the
+    //    project's PTYs (a `taskkill /T` tree kill on Windows) frees those.
+    //    Match on both the path the caller passed and its canonical form, since
+    //    the PTY registry is keyed by whatever path the project was opened with.
     let canonical_str = canonical.to_string_lossy().to_string();
-    let mut killed = crate::commands::pty::kill_project_pty_internal(&path);
+    crate::commands::pty::kill_project_pty_internal(&path);
     if canonical_str != path {
-        killed += crate::commands::pty::kill_project_pty_internal(&canonical_str);
+        crate::commands::pty::kill_project_pty_internal(&canonical_str);
     }
 
     // The delete has brief waits and retries (see robust_remove_dir_all), so run
     // it off the async runtime rather than blocking a worker thread.
     tokio::task::spawn_blocking(move || {
-        if killed > 0 {
-            // Give the OS a moment to release the handles after the processes
-            // exit before we try to remove the files.
-            std::thread::sleep(std::time::Duration::from_millis(300));
-        }
+        // Give the OS a moment to release the watcher and process handles we
+        // just dropped before we start removing files. The retry loop in
+        // robust_remove_dir_all backs this up if it needs longer.
+        std::thread::sleep(std::time::Duration::from_millis(300));
         robust_remove_dir_all(&canonical)
     })
     .await
