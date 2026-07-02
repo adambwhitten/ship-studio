@@ -738,6 +738,55 @@ pub async fn remove_git_history(project_path: String) -> Result<(), CommandError
     Ok(())
 }
 
+/// Recursively delete a directory, resilient to the two Windows failure modes
+/// that plain `remove_dir_all` hits during project deletion:
+/// - **Read-only files** (ERROR_ACCESS_DENIED / os error 5). Git marks its
+///   packed objects read-only, and Windows refuses to delete a read-only file.
+/// - **Files still held open** (ERROR_SHARING_VIOLATION / os error 32). A handle
+///   a just-killed process owned usually clears within a moment.
+///
+/// On Unix this is effectively a plain `remove_dir_all` (the loop succeeds on
+/// the first pass and the read-only handling compiles out).
+fn robust_remove_dir_all(path: &Path) -> std::io::Result<()> {
+    const MAX_ATTEMPTS: u32 = 5;
+    for attempt in 0..MAX_ATTEMPTS {
+        #[cfg(windows)]
+        clear_readonly_recursive(path);
+
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if attempt + 1 == MAX_ATTEMPTS => return Err(e),
+            Err(_) => {
+                // Back off before retrying: 150ms, 300ms, 600ms, 1200ms.
+                std::thread::sleep(std::time::Duration::from_millis(150 * (1 << attempt)));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Clear the read-only attribute on every file and directory under `path` so
+/// Windows will allow deletion. Best-effort; unreadable entries are skipped.
+#[cfg(windows)]
+fn clear_readonly_recursive(path: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    let mut perms = meta.permissions();
+    if perms.readonly() {
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+    if meta.file_type().is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                clear_readonly_recursive(&entry.path());
+            }
+        }
+    }
+}
+
 /// Deletes a project directory. Only allows deletion from ~/ShipStudio.
 /// External projects cannot be deleted — use unregister_external_project instead.
 #[tauri::command]
@@ -765,7 +814,32 @@ pub async fn delete_project(path: String) -> Result<(), CommandError> {
         return Err(("Can only delete projects from the projects directory".to_string()).into());
     }
 
-    std::fs::remove_dir_all(&canonical).map_err(|e| e.to_string())?;
+    // Release any handles Ship Studio holds on the project before deleting it.
+    // On Windows a file open by a running dev server or agent terminal makes
+    // `remove_dir_all` fail with "being used by another process" (os error 32);
+    // killing the project's PTYs frees those handles. Harmless on other
+    // platforms, and it avoids orphaning a dev server after the folder is gone.
+    // Match on both the path the caller passed and its canonical form, since the
+    // PTY registry is keyed by whatever path the project was opened with.
+    let canonical_str = canonical.to_string_lossy().to_string();
+    let mut killed = crate::commands::pty::kill_project_pty_internal(&path);
+    if canonical_str != path {
+        killed += crate::commands::pty::kill_project_pty_internal(&canonical_str);
+    }
+
+    // The delete has brief waits and retries (see robust_remove_dir_all), so run
+    // it off the async runtime rather than blocking a worker thread.
+    tokio::task::spawn_blocking(move || {
+        if killed > 0 {
+            // Give the OS a moment to release the handles after the processes
+            // exit before we try to remove the files.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        robust_remove_dir_all(&canonical)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
