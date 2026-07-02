@@ -126,6 +126,24 @@ pub async fn kill_window_pty(window_label: String) -> Result<u32, CommandError> 
     Ok(count)
 }
 
+/// Whether two project path strings refer to the same project. Windows paths
+/// arrive in mixed forms (`C:\foo` vs `C:/foo`, drive-letter casing), so an
+/// exact string comparison silently misses there; the project's processes then
+/// survive the kill and keep file handles open, which blocks deleting the
+/// project directory.
+fn same_project_path(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let normalize = |s: &str| s.replace('\\', "/").to_ascii_lowercase();
+        return normalize(a) == normalize(b);
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 /// Kill all PTY processes associated with a specific project path (sync).
 ///
 /// Internal helper shared by the Tauri command and the sessions module.
@@ -137,7 +155,11 @@ pub fn kill_project_pty_internal(project_path: &str) -> u32 {
         };
         registry
             .iter()
-            .filter(|(_, info)| info.project_path.as_deref() == Some(project_path))
+            .filter(|(_, info)| {
+                info.project_path
+                    .as_deref()
+                    .is_some_and(|p| same_project_path(p, project_path))
+            })
             .map(|(&id, info)| (id, info.pid))
             .collect()
     };

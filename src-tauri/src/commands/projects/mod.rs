@@ -738,51 +738,116 @@ pub async fn remove_git_history(project_path: String) -> Result<(), CommandError
     Ok(())
 }
 
-/// Recursively delete a directory, resilient to the two Windows failure modes
-/// that plain `remove_dir_all` hits during project deletion:
+/// The exact filesystem entry a failed delete got stuck on. `remove_dir_all`'s
+/// io::Error never names the path, which makes Windows failures like "Access is
+/// denied (os error 5)" undiagnosable; this keeps the "on what?" attached.
+struct RemoveBlocked {
+    path: PathBuf,
+    source: std::io::Error,
+}
+
+/// Recursively delete a directory, resilient to the Windows failure modes that
+/// plain `remove_dir_all` hits during project deletion, and naming the exact
+/// entry that blocked when it still fails:
 /// - **Read-only files** (ERROR_ACCESS_DENIED / os error 5). Git marks its
 ///   packed objects read-only, and Windows refuses to delete a read-only file.
-/// - **Files still held open** (ERROR_SHARING_VIOLATION / os error 32). A handle
-///   a just-killed process owned usually clears within a moment.
+///   Cleared inline, immediately before each removal.
+/// - **Files or directories still held open** (os errors 5/32). Handles from a
+///   just-killed process or just-stopped watcher usually release within a
+///   moment, so the whole tree is retried with backoff.
 ///
-/// On Unix this is effectively a plain `remove_dir_all` (the loop succeeds on
-/// the first pass and the read-only handling compiles out).
-fn robust_remove_dir_all(path: &Path) -> std::io::Result<()> {
+/// On Unix this behaves like a plain recursive delete (the read-only handling
+/// compiles out and the first pass succeeds).
+fn robust_remove_dir_all(path: &Path) -> Result<(), String> {
     const MAX_ATTEMPTS: u32 = 5;
+    let mut last: Option<RemoveBlocked> = None;
     for attempt in 0..MAX_ATTEMPTS {
-        #[cfg(windows)]
-        clear_readonly_recursive(path);
-
-        match std::fs::remove_dir_all(path) {
+        match remove_tree(path) {
             Ok(()) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) if attempt + 1 == MAX_ATTEMPTS => return Err(e),
-            Err(_) => {
-                // Back off before retrying: 150ms, 300ms, 600ms, 1200ms.
-                std::thread::sleep(std::time::Duration::from_millis(150 * (1 << attempt)));
+            Err(blocked) => {
+                tracing::warn!(
+                    blocked = %blocked.path.display(),
+                    error = %blocked.source,
+                    attempt = attempt + 1,
+                    "Project delete pass failed"
+                );
+                last = Some(blocked);
+                if attempt + 1 < MAX_ATTEMPTS {
+                    // Back off before retrying: 150ms, 300ms, 600ms, 1200ms.
+                    std::thread::sleep(std::time::Duration::from_millis(150 * (1 << attempt)));
+                }
             }
         }
     }
-    Ok(())
+    // Reached only after every attempt failed, so `last` is always set.
+    let RemoveBlocked {
+        path: blocked,
+        source,
+    } = last.expect("delete failed but no blocking entry was recorded");
+    Err(format!("{source} (while deleting {})", blocked.display()))
 }
 
-/// Clear the read-only attribute on every file and directory under `path` so
-/// Windows will allow deletion. Best-effort; unreadable entries are skipped.
-#[cfg(windows)]
-fn clear_readonly_recursive(path: &Path) {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    let mut perms = meta.permissions();
-    if perms.readonly() {
-        perms.set_readonly(false);
-        let _ = std::fs::set_permissions(path, perms);
+/// One delete pass over the tree. Clears the Windows read-only attribute right
+/// before each removal; on failure reports the exact entry that blocked.
+fn remove_tree(path: &Path) -> Result<(), RemoveBlocked> {
+    fn fail(path: &Path, source: std::io::Error) -> RemoveBlocked {
+        RemoveBlocked {
+            path: path.to_path_buf(),
+            source,
+        }
     }
-    if meta.file_type().is_dir() {
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                clear_readonly_recursive(&entry.path());
+
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(fail(path, e)),
+    };
+
+    clear_readonly(path, &meta);
+
+    let file_type = meta.file_type();
+    if file_type.is_dir() && !file_type.is_symlink() {
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(e) => return Err(fail(path, e)),
+        };
+        for entry in entries {
+            match entry {
+                Ok(entry) => remove_tree(&entry.path())?,
+                Err(e) => return Err(fail(path, e)),
             }
+        }
+        match std::fs::remove_dir(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(fail(path, e)),
+        }
+    } else {
+        // Files and symlinks. A directory symlink or junction on Windows must
+        // be removed with remove_dir, so fall back to it when remove_file
+        // refuses (without following the link into its target).
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(first) => match std::fs::remove_dir(path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(_) => Err(fail(path, first)),
+            },
+        }
+    }
+}
+
+/// Clear the Windows read-only attribute so deletion is allowed. No-op on Unix,
+/// where deletability depends on the parent directory, not the entry itself.
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn clear_readonly(path: &Path, meta: &std::fs::Metadata) {
+    #[cfg(windows)]
+    {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(path, perms);
         }
     }
 }
@@ -845,8 +910,7 @@ pub async fn delete_project(path: String) -> Result<(), CommandError> {
         robust_remove_dir_all(&canonical)
     })
     .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())??;
     Ok(())
 }
 
